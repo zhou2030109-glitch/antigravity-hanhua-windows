@@ -62,6 +62,7 @@ LAUNCHD_LABEL = 'com.nick.antigravity-hanhua'
 # Windows 开机自启注册表项（HKCU\...\Run 下的值名）
 RUN_KEY_NAME = 'AntigravityHanhuaDaemon'
 RUN_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Run'
+RECOVERY_TASK_NAME = 'AntigravityHanhuaRecovery'
 
 # 本工具只支持 macOS / Windows。早退比让后面的系统调用逐个诡异失败要好。
 if sys.platform not in ('darwin', 'win32'):
@@ -1786,6 +1787,34 @@ def inject_with_retry(port, engine_js, watch_seconds, attempts=3, verbose=True):
 # 常驻守护模式
 # ============================================================
 
+def log_daemon(msg, log_path=DAEMON_LOG):
+    line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg
+    print(line, flush=True)
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def daemon_mutex_win():
+    """防止登录自启、手动安装和恢复任务同时启动多个守护进程。"""
+    import ctypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel.CloseHandle.restype = ctypes.c_bool
+    handle = kernel.CreateMutexW(None, False, r'Local\AntigravityHanhuaDaemon')
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel.CloseHandle(ctypes.c_void_p(handle))
+        return None
+    return handle
+
+
 def daemon_loop(interval=DAEMON_INTERVAL, log_path=DAEMON_LOG):
     """常驻守护：每 interval 秒巡检一次。
 
@@ -1796,14 +1825,12 @@ def daemon_loop(interval=DAEMON_INTERVAL, log_path=DAEMON_LOG):
 
     正常巡检不写日志（防止日志无限增长），只在注入和异常时追加。
     """
+    mutex = daemon_mutex_win() if IS_WINDOWS else None
+    if IS_WINDOWS and mutex is None:
+        return
+
     def log(msg):
-        line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg
-        print(line, flush=True)
-        try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+        log_daemon(msg, log_path)
 
     log(f"[守护] 常驻模式启动（每 {interval} 秒巡检，日志: {log_path}）")
     while True:
@@ -1905,11 +1932,64 @@ def install_autostart_win():
     print("[成功] 已注册登录自启（注册表 Run 项）")
     print(f"       注册表: HKCU\\{RUN_KEY_PATH}\\{RUN_KEY_NAME}")
     print(f"       日志: {DAEMON_LOG}")
-    if start_daemon_detached():
+    task_command = subprocess.list2cmdline([python, script, '--recover'])
+    task = srun(
+        ['schtasks', '/Create', '/TN', RECOVERY_TASK_NAME,
+         '/TR', task_command, '/SC', 'MINUTE', '/MO', '1', '/IT', '/F'],
+        capture_output=True, text=True)
+    if task.returncode != 0:
+        print(f"[错误] 每分钟恢复任务注册失败: {(task.stderr or task.stdout).strip()}")
+        sys.exit(1)
+    print(f"[成功] 已注册每分钟恢复任务: {RECOVERY_TASK_NAME}")
+    try:
+        running = bool(daemon_pids_win())
+    except Exception as e:
+        print(f"[提示] 无法检查现有守护进程: {e}")
+        running = False
+    if not running:
+        start_daemon_detached()
+        time.sleep(0.5)
+    try:
+        running = bool(daemon_pids_win())
+    except Exception:
+        running = False
+    if running:
         print("[效果] 守护进程已启动；打开 Antigravity 后几秒内自动汉化，无需任何手动操作")
     else:
-        print("[提示] 守护进程拉起失败，重启系统后会自动生效；或手动执行: "
-              f"{python} {script} --daemon")
+        print("[提示] 守护进程拉起失败，每分钟恢复任务将重试")
+
+
+def daemon_pids_win():
+    """只查本脚本的守护进程，避免把其他 Python 进程误判为汉化守护。"""
+    script = os.path.abspath(__file__).replace("'", "''")
+    ps = (f"$script = '{script}'; "
+          "Get-CimInstance Win32_Process | Where-Object { "
+          "$_.Name -match '^pythonw?\\.exe$' -and "
+          "$_.CommandLine -and $_.CommandLine.Contains($script) -and "
+          "$_.CommandLine -match ' --daemon(?:\\s|$)' } | "
+          "Select-Object -ExpandProperty ProcessId")
+    r = srun(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+             capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip())
+    return [int(line.strip()) for line in r.stdout.splitlines() if line.strip().isdigit()]
+
+
+def recover_daemon_win():
+    """计划任务每分钟执行一次；重启守护并补救漏掉的界面注入。"""
+    try:
+        if not daemon_pids_win():
+            log_daemon('[恢复] 守护进程不存在，正在重新启动')
+            if not start_daemon_detached():
+                raise RuntimeError('无法启动守护进程')
+            time.sleep(0.5)
+            if not daemon_pids_win():
+                raise RuntimeError('守护进程启动后立即退出')
+            log_daemon('[恢复] 守护进程已重新启动')
+        daemon_step(log_daemon)
+    except Exception as e:
+        log_daemon(f'[恢复失败] {type(e).__name__}: {e}')
+        sys.exit(1)
 
 
 def _kill_daemon_win():
@@ -1932,9 +2012,19 @@ def uninstall_autostart_win():
         ['reg', 'delete', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME, '/f'],
         capture_output=True, text=True)
     removed = r.returncode == 0
+    task = srun(['schtasks', '/Delete', '/TN', RECOVERY_TASK_NAME, '/F'],
+                capture_output=True, text=True)
     _kill_daemon_win()
+    if task.returncode != 0:
+        existing = srun(['schtasks', '/Query', '/TN', RECOVERY_TASK_NAME],
+                        capture_output=True, text=True)
+        if existing.returncode == 0:
+            print(f"[错误] 无法移除每分钟恢复任务: {(task.stderr or task.stdout).strip()}")
+            sys.exit(1)
     if removed:
         print("[成功] 已停止守护并移除登录自启（注册表 Run 项）")
+        if task.returncode == 0:
+            print(f"[成功] 已移除每分钟恢复任务: {RECOVERY_TASK_NAME}")
         print("[效果] 下次打开 Antigravity 将回到英文原版")
     else:
         print("[提示] 未安装（注册表 Run 项不存在）")
@@ -1946,7 +2036,15 @@ def autostart_status_win():
         capture_output=True, text=True)
     if r.returncode != 0:
         return "未安装"
-    return "已安装（登录自启，注册表 Run 项）"
+    ps = ("(Get-ScheduledTask -TaskName '" + RECOVERY_TASK_NAME
+          + "' -ErrorAction SilentlyContinue).State")
+    task = srun(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                capture_output=True, text=True)
+    if task.returncode == 0 and task.stdout.strip() in ('Ready', 'Running', 'Queued'):
+        return "已安装（登录自启 + 每分钟自动恢复）"
+    if task.stdout.strip() == 'Disabled':
+        return "仅登录自启（每分钟恢复任务已禁用）"
+    return "仅登录自启（缺少每分钟恢复任务）"
 
 
 def install_launchd():
@@ -2037,6 +2135,11 @@ def show_status():
     running = is_antigravity_running()
     print(f"Antigravity 进程: {'运行中' if running else '未运行'}")
     print(f"{'登录自启守护' if IS_WINDOWS else 'launchd 守护'}:     {launchd_status()}")
+    if IS_WINDOWS:
+        try:
+            print(f"守护进程:         {'运行中' if daemon_pids_win() else '未运行（等待自动恢复）'}")
+        except Exception as e:
+            print(f"守护进程:         检测失败（{e}）")
     dict_map = load_dictionary()
     print(f"字典词条:         {len(dict_map)} 条")
     port = discover_cdp_port(timeout=3)
@@ -2461,6 +2564,8 @@ def main():
                         help="代理地址（如 http://127.0.0.1:7897），启动 Antigravity 时注入环境变量")
     parser.add_argument("--daemon", action="store_true",
                         help="常驻守护模式：巡检 Antigravity，发现未汉化自动注入")
+    parser.add_argument("--recover", action="store_true",
+                        help="Windows 恢复任务：守护进程退出时重新启动")
     parser.add_argument("--interval", type=int, default=DAEMON_INTERVAL,
                         help=f"守护巡检间隔秒数（默认 {DAEMON_INTERVAL}）")
     parser.add_argument("--install", action="store_true",
@@ -2489,6 +2594,11 @@ def main():
         uninstall_launchd()
     elif args.daemon:
         daemon_loop(interval=args.interval)
+    elif args.recover:
+        if IS_WINDOWS:
+            recover_daemon_win()
+        else:
+            parser.error('--recover 仅用于 Windows')
     elif args.guard:
         guard_main(seconds=args.watch, port=args.port)
     elif args.click:

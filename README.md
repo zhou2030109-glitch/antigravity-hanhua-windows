@@ -12,8 +12,9 @@ Protocol）把 MutationObserver 翻译引擎注入运行中的界面内存，官
 - **零第三方依赖**：内置迷你 WebSocket 客户端（MiniWS），Python 3.7+ 标准库直接可跑
 - **官方升级免疫**：不碰安装文件；CDP 端口随机分配、自动发现（DevToolsActivePort →
   端口缓存 → netstat 扫描三级探测）
-- **自动守护**：注册表 Run 项登录自启（pythonw 无窗口，约 12 MB 内存，每 5 秒巡检），
-  打开 Antigravity 几秒内自动变中文；页面重载冲掉翻译自动补注
+- **自动守护 + 故障恢复**：注册表 Run 项登录自启（pythonw 无窗口，每 5 秒巡检）；
+  Windows 计划任务每分钟检查一次守护进程，意外退出后自动重启。打开 Antigravity
+  几秒内自动变中文；页面重载冲掉翻译也会自动补注
 - **只翻界面不翻内容**：会话标题、代码、终端输出、文件路径、输入框内容保持原样；
   产品名（Antigravity / Gemini / MCP 等）原样保留
 - **可自助补词**：`caiji.py` 采集未翻译文案 / 检测官方更新后的失效词条
@@ -28,12 +29,13 @@ python jack.py --check-syntax
 python jack.py --no-launch
 python jack.py            # 未运行则先启动再注入，并守护 30 秒
 
-# 3. 一劳永逸：注册登录自启守护 + 生成桌面快捷方式
+# 3. 注册登录自启守护、每分钟故障恢复任务，再生成桌面快捷方式
 python jack.py --install
 python jack.py --create-shortcut
 ```
 
-恢复英文：直接正常重开 Antigravity（注入只存在于内存）。
+恢复英文：未安装守护时，正常重开 Antigravity 即可；已执行 `--install` 时，
+先运行 `python jack.py --uninstall`，再重开 Antigravity。
 彻底卸载：`python jack.py --uninstall`，再删除本目录与桌面快捷方式。
 
 ## 命令一览
@@ -42,8 +44,9 @@ python jack.py --create-shortcut
 python jack.py --status          # 状态：进程 / CDP 端口 / 引擎 / 自启
 python jack.py --no-launch       # 只注入正在运行的实例
 python jack.py --daemon          # 常驻守护（--install 会自动拉起）
-python jack.py --install         # 注册登录自启守护（HKCU Run 项）
-python jack.py --uninstall       # 停止守护 + 移除自启
+python jack.py --recover         # 单次健康检查，守护进程退出时拉起（计划任务调用）
+python jack.py --install         # 注册 HKCU Run 自启及每分钟故障恢复任务
+python jack.py --uninstall       # 停止守护 + 移除自启和恢复任务
 python jack.py --click           # 双击模式：没开就启动，然后注入（快捷方式用它）
 python jack.py --create-shortcut # 生成「Antigravity 汉化」.lnk（借用原版图标）
 python jack.py --check-syntax    # 四层自检：AST / JSON / 结构不变量 / JS 语法
@@ -52,6 +55,12 @@ python caiji.py --misses         # 检测失效词条 → misses.json
 ```
 
 守护日志：`%LOCALAPPDATA%\com.nick.jack-hanhua\antigravity-hanhua.log`
+
+若升级自旧版，重新执行一次 `python jack.py --install`，才会注册故障恢复任务。
+可运行 `python jack.py --status` 确认显示“登录自启 + 每分钟自动恢复”。
+恢复任务名为 `AntigravityHanhuaRecovery`，只有当前用户已登录时才运行；
+守护进程意外退出后最多约一分钟重新拉起。若计划任务注册失败，安装命令会报错，
+不会把仅有注册表自启的状态误报成完整安装。
 
 ## 补充词条
 
