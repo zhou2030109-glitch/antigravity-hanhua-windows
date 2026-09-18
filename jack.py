@@ -68,6 +68,28 @@ if sys.platform not in ('darwin', 'win32'):
     sys.exit(f"[错误] 本工具仅支持 macOS / Windows，当前平台: {sys.platform}")
 
 
+def srun(*args, **kwargs):
+    """subprocess.run 的静默封装。
+
+    Windows 下从无控制台宿主（pythonw 守护进程、.lnk 双击）拉起 tasklist /
+    netstat / reg 这类控制台程序时，子进程没有可继承的控制台，系统会为它
+    新建一个——表现为黑窗不停闪出。统一经此封装并强制 CREATE_NO_WINDOW。
+
+    另修中文 Windows 的解码坑：reg/tasklist 等输出是 ANSI(GBK) 字节，
+    而 Python 3.13+ / UTF-8 模式下 text=True 按 UTF-8 解码 → UnicodeDecodeError
+    （异常发生在 subprocess 的读取线程里，stdout 静默变空）。文本模式统一
+    按 GB18030 解码 + errors=replace。
+    """
+    if IS_WINDOWS:
+        kwargs['creationflags'] = (kwargs.get('creationflags', 0)
+                                   | getattr(subprocess, 'CREATE_NO_WINDOW',
+                                             0x08000000))
+        if kwargs.get('text') or kwargs.get('universal_newlines'):
+            kwargs.setdefault('encoding', 'gb18030')
+            kwargs.setdefault('errors', 'replace')
+    return subprocess.run(*args, **kwargs)
+
+
 # ============================================================
 # 迷你 WebSocket 客户端（纯标准库，只实现 CDP 需要的能力）
 # ============================================================
@@ -296,7 +318,7 @@ def antigravity_pids():
         if IS_WINDOWS:
             # tasklist 拿不到命令行，无法区分主进程与 Helper；但 Helper 不监听
             # CDP，端口探测阶段会被 /json/version 自然过滤掉。
-            out = subprocess.run(
+            out = srun(
                 ['tasklist', '/FI', 'IMAGENAME eq Antigravity.exe',
                  '/FO', 'CSV', '/NH'],
                 capture_output=True, text=True, timeout=8).stdout
@@ -307,7 +329,7 @@ def antigravity_pids():
                         and fields[1].isdigit() and fields[1] != my_pid):
                     pids.append(fields[1])
             return pids
-        out = subprocess.run(['ps', '-eo', 'pid=,command='],
+        out = srun(['ps', '-eo', 'pid=,command='],
                              capture_output=True, text=True, timeout=5).stdout
         pids = []
         for line in out.splitlines():
@@ -1573,7 +1595,7 @@ def _scan_ports_once():
         listen_ports = []
         if IS_WINDOWS:
             try:
-                ns = subprocess.run(['netstat', '-ano', '-p', 'tcp'],
+                ns = srun(['netstat', '-ano', '-p', 'tcp'],
                                     capture_output=True,
                                     timeout=5).stdout.decode(errors='replace')
                 pid_set = set(pids)
@@ -1589,7 +1611,7 @@ def _scan_ports_once():
                 pass
         else:
             try:
-                ls = subprocess.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', ','.join(pids)],
+                ls = srun(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', ','.join(pids)],
                                     capture_output=True, timeout=2).stdout.decode()
                 for m in re.finditer(r'127[.]0[.]0[.]1:(\d+)', ls):
                     listen_ports.append(int(m.group(1)))
@@ -1873,7 +1895,7 @@ def install_autostart_win():
     script = os.path.abspath(__file__)
     python = _bg_python()
     cmd = f'"{python}" "{script}" --daemon'
-    r = subprocess.run(
+    r = srun(
         ['reg', 'add', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME,
          '/t', 'REG_SZ', '/d', cmd, '/f'],
         capture_output=True, text=True)
@@ -1899,14 +1921,14 @@ def _kill_daemon_win():
           "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
           "-ErrorAction SilentlyContinue }")
     try:
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+        srun(['powershell', '-NoProfile', '-Command', ps],
                        capture_output=True, timeout=15)
     except Exception:
         pass
 
 
 def uninstall_autostart_win():
-    r = subprocess.run(
+    r = srun(
         ['reg', 'delete', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME, '/f'],
         capture_output=True, text=True)
     removed = r.returncode == 0
@@ -1919,7 +1941,7 @@ def uninstall_autostart_win():
 
 
 def autostart_status_win():
-    r = subprocess.run(
+    r = srun(
         ['reg', 'query', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME],
         capture_output=True, text=True)
     if r.returncode != 0:
@@ -1950,7 +1972,7 @@ def install_launchd():
         plistlib.dump(plist_obj, f)
 
     # launchctl load 失败时 exit code 仍可能为 0，必须看 stderr
-    r = subprocess.run(['launchctl', 'load', '-w', PLIST_PATH], capture_output=True)
+    r = srun(['launchctl', 'load', '-w', PLIST_PATH], capture_output=True)
     err = (r.stderr or b'').decode(errors='replace')
     if 'failed' in err.lower() or 'error' in err.lower():
         # 从 Electron 桌面端（WorkBuddy 等）派生的终端与 launchd 通信会被拒，
@@ -1978,9 +2000,9 @@ def uninstall_launchd():
     if IS_WINDOWS:
         return uninstall_autostart_win()
     # 杀掉所有守护进程（launchd 管理的或直接拉起的）
-    subprocess.run(['pkill', '-f', 'jack.py --daemon'], capture_output=True)
+    srun(['pkill', '-f', 'jack.py --daemon'], capture_output=True)
     if os.path.exists(PLIST_PATH):
-        subprocess.run(['launchctl', 'unload', PLIST_PATH], capture_output=True)
+        srun(['launchctl', 'unload', PLIST_PATH], capture_output=True)
         os.remove(PLIST_PATH)
         print(f"[成功] 已停止守护并移除配置（{LAUNCHD_LABEL}）")
         print("[效果] 下次打开 Antigravity 将回到英文原版")
@@ -1997,11 +2019,11 @@ def launchd_status():
         return autostart_status_win()
     if not os.path.exists(PLIST_PATH):
         return "未安装"
-    r = subprocess.run(['launchctl', 'list'], capture_output=True, text=True)
+    r = srun(['launchctl', 'list'], capture_output=True, text=True)
     if LAUNCHD_LABEL in r.stdout:
         return "已安装（launchd 托管，运行中）"
     # launchctl 不可达的终端里 list 为空，退化用进程判断
-    p = subprocess.run(['pgrep', '-f', 'jack.py --daemon'],
+    p = srun(['pgrep', '-f', 'jack.py --daemon'],
                        capture_output=True, text=True)
     return "已安装，守护运行中" if p.stdout.strip() else "已安装，守护未运行"
 
@@ -2122,7 +2144,7 @@ def check_syntax():
             fp.write(engine_js)
         node_path = shutil.which('node')
         if node_path:
-            res = subprocess.run([node_path, '--check', temp_js],
+            res = srun([node_path, '--check', temp_js],
                                  capture_output=True, text=True)
             if res.returncode == 0:
                 print(f"  [Node.js AST]  注入引擎 JavaScript 静态语法分析通过（{len(engine_js)} 字符）")
@@ -2160,7 +2182,7 @@ def click_main(verbose=True):
                 return False, "未找到 Antigravity 安装路径"
             launch_antigravity(exe)
         else:
-            subprocess.run(['open', '-a', 'Antigravity'])
+            srun(['open', '-a', 'Antigravity'])
         for _ in range(150):
             if is_antigravity_running():
                 break
@@ -2287,7 +2309,7 @@ def create_shortcut_win():
     if icon:
         ps += f"$s.IconLocation = {psq(icon + ',0')}; "
     ps += "$s.Save()"
-    r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+    r = srun(['powershell', '-NoProfile', '-Command', ps],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0 or not os.path.exists(lnk_path):
         print(f"[错误] 生成快捷方式失败: {(r.stderr or r.stdout).strip()}")
@@ -2340,7 +2362,7 @@ def create_shortcut():
         # 旧的存在先移除（osacompile 不覆盖会报错）
         if os.path.exists(app_path):
             shutil.rmtree(app_path)
-        r = subprocess.run(['osacompile', '-o', app_path, scpt_path],
+        r = srun(['osacompile', '-o', app_path, scpt_path],
                            capture_output=True)
         if r.returncode != 0:
             print(f"[错误] 生成失败: {r.stderr.decode(errors='replace')}")
@@ -2354,7 +2376,7 @@ def create_shortcut():
     if os.path.exists(icon_src):
         try:
             shutil.copy(icon_src, icon_dst)
-            subprocess.run(['touch', app_path])  # 刷新 Finder 图标缓存
+            srun(['touch', app_path])  # 刷新 Finder 图标缓存
         except Exception:
             pass
 
