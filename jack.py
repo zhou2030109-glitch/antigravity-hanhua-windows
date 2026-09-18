@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Antigravity 2.0 运行时汉化工具 V2.0 —— CDP 注入版（macOS 适配 + 自动化守护）
+r"""Antigravity 2.0 运行时汉化工具 V2.0 —— CDP 注入版（macOS / Windows 适配 + 自动化守护）
 
 V2.0 相对 V1.0 的改进：
 - 零第三方依赖：内置迷你 WebSocket 客户端（MiniWS），不再需要 pip install websockets，
@@ -14,19 +14,20 @@ V2.0 相对 V1.0 的改进：
 原理（同 V1.0）：不修改任何安装文件，通过 CDP 把 MutationObserver 翻译引擎注入
 渲染页面。想恢复英文，关掉 Antigravity 正常重开即可。
 
-macOS 适配要点：
-- 安装路径 /Applications/Antigravity.app；进程检测用 pgrep
-- macOS 上 Antigravity 忽略 --remote-debugging-port 参数，实际 CDP 端口随机分配，
-  脚本自动扫描进程监听端口发现真实 CDP
+平台适配要点：
+- macOS 安装路径 /Applications/Antigravity.app，进程检测用 ps；
+  Windows 安装路径 %LOCALAPPDATA%\Programs\antigravity，进程检测用 tasklist
+- Antigravity 忽略 --remote-debugging-port 参数，实际 CDP 端口随机分配，
+  脚本自动扫描进程监听端口发现真实 CDP（macOS 用 lsof，Windows 用 netstat）
 - 清除 ELECTRON_RUN_AS_NODE 环境变量（从 Electron 宿主派生的 shell 会带它，
   导致 Antigravity 以纯 Node 模式启动、拒绝 Chromium 参数）
 
 用法：
   python3 jack.py                  # 手动：启动 Antigravity + 注入 + 守护 30 秒
   python3 jack.py --no-launch      # 只注入已运行的实例
-  python3 jack.py --daemon         # 常驻守护模式（launchd 或手动后台跑）
-  python3 jack.py --install        # 安装 launchd 开机自启（登录后自动守护）
-  python3 jack.py --uninstall      # 卸载 launchd 自启
+  python3 jack.py --daemon         # 常驻守护模式（launchd / 注册表自启或手动后台跑）
+  python3 jack.py --install        # 安装登录自启守护（macOS launchd / Windows Run 注册表项）
+  python3 jack.py --uninstall      # 卸载登录自启守护
   python3 jack.py --status         # 查看状态
   python3 jack.py --check-syntax   # 语法与完整性自检
 """
@@ -47,13 +48,24 @@ import urllib.parse
 
 # ★★★ 配置 ★★★
 DAEMON_INTERVAL = 5          # 守护巡检间隔（秒）
-DAEMON_LOG = os.path.expanduser('~/Library/Logs/antigravity-hanhua.log')
+IS_WINDOWS = sys.platform == 'win32'
+if IS_WINDOWS:
+    _CACHE_BASE = os.path.join(
+        os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+        'com.nick.jack-hanhua')
+else:
+    _CACHE_BASE = os.path.expanduser('~/Library/Caches/com.nick.jack-hanhua')
+DAEMON_LOG = (os.path.join(_CACHE_BASE, 'antigravity-hanhua.log') if IS_WINDOWS
+              else os.path.expanduser('~/Library/Logs/antigravity-hanhua.log'))
 PLIST_PATH = os.path.expanduser('~/Library/LaunchAgents/com.nick.antigravity-hanhua.plist')
 LAUNCHD_LABEL = 'com.nick.antigravity-hanhua'
+# Windows 开机自启注册表项（HKCU\...\Run 下的值名）
+RUN_KEY_NAME = 'AntigravityHanhuaDaemon'
+RUN_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
-# 本工具只支持 macOS。早退比让后面的 lsof / launchctl / osascript 逐个诡异失败要好。
-if sys.platform != 'darwin':
-    sys.exit(f"[错误] 本工具仅支持 macOS，当前平台: {sys.platform}")
+# 本工具只支持 macOS / Windows。早退比让后面的系统调用逐个诡异失败要好。
+if sys.platform not in ('darwin', 'win32'):
+    sys.exit(f"[错误] 本工具仅支持 macOS / Windows，当前平台: {sys.platform}")
 
 
 # ============================================================
@@ -206,10 +218,22 @@ def cdp_value(resp):
 # ============================================================
 
 EXE_NAME = 'Antigravity'
-CANDIDATE_PATHS = (
-    '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
-    os.path.expanduser('~/Applications/Antigravity.app/Contents/MacOS/Antigravity'),
-)
+EXE_NAME_WIN = 'Antigravity.exe'
+if IS_WINDOWS:
+    _la = os.environ.get('LOCALAPPDATA') or ''
+    _pf = os.environ.get('ProgramFiles') or ''
+    _pfx = os.environ.get('ProgramFiles(x86)') or ''
+    CANDIDATE_PATHS = tuple(p for p in (
+        os.path.join(_la, 'Programs', 'antigravity', EXE_NAME_WIN),
+        os.path.join(_la, 'Programs', 'Antigravity', EXE_NAME_WIN),
+        os.path.join(_pf, 'Antigravity', EXE_NAME_WIN),
+        os.path.join(_pfx, 'Antigravity', EXE_NAME_WIN),
+    ) if p and p[1:3] == ':\\')
+else:
+    CANDIDATE_PATHS = (
+        '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+        os.path.expanduser('~/Applications/Antigravity.app/Contents/MacOS/Antigravity'),
+    )
 
 # 只匹配主进程可执行文件本身，末尾必须是空白或行尾——否则会连
 # "Antigravity Helper.app/.../Antigravity Helper" 一起匹配上。
@@ -221,6 +245,9 @@ _MAIN_PROC_RE = re.compile(
     r'/Antigravity\.app/Contents/MacOS/Antigravity'
     r'(?=\s|$)'
 )
+# Windows 主进程匹配：安装目录下的 Antigravity.exe，命令行不带 --type= 的即主进程。
+# Helper（--type=renderer/gpu-process 等）不开 CDP 端口，扫它纯属浪费探测。
+_MAIN_PROC_RE_WIN = re.compile(r'Antigravity\.exe(?=\s|$|")', re.IGNORECASE)
 
 # CDP 端口探测用：Chromium 的 /json/version 里 Browser 字段形如 "Chrome/146.0..."
 _CDP_BROWSER_HINT = 'Chrome'
@@ -233,8 +260,18 @@ def find_antigravity_exe(install_dir=None):
     """
     if install_dir:
         cand = os.path.expanduser(install_dir)
-        if os.path.basename(cand) == EXE_NAME and os.path.isfile(cand):
+        exe_names = {EXE_NAME_WIN.lower()} if IS_WINDOWS else {EXE_NAME.lower()}
+        if os.path.basename(cand).lower() in exe_names and os.path.isfile(cand):
             return cand
+        if IS_WINDOWS:
+            win_cands = (
+                os.path.join(cand, EXE_NAME_WIN),
+                os.path.join(cand, 'Antigravity', EXE_NAME_WIN),
+            )
+            for p in win_cands:
+                if os.path.isfile(p):
+                    return p
+            return None
         for p in (
             os.path.join(cand, 'Contents', 'MacOS', EXE_NAME),
             os.path.join(cand, 'Antigravity.app', 'Contents', 'MacOS', EXE_NAME),
@@ -252,10 +289,24 @@ def find_antigravity_exe(install_dir=None):
 def antigravity_pids():
     """Antigravity 主进程 PID 列表（字符串）。
 
-    只认主进程，不要 Helper：Helper 不开 CDP 端口，扫它纯属浪费 lsof 调用。
+    只认主进程，不要 Helper：Helper 不开 CDP 端口，扫它纯属浪费端口探测。
     """
     try:
         my_pid = str(os.getpid())
+        if IS_WINDOWS:
+            # tasklist 拿不到命令行，无法区分主进程与 Helper；但 Helper 不监听
+            # CDP，端口探测阶段会被 /json/version 自然过滤掉。
+            out = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq Antigravity.exe',
+                 '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=8).stdout
+            pids = []
+            for line in out.splitlines():
+                fields = [f.strip().strip('"') for f in line.split('","')]
+                if (len(fields) >= 2 and fields[0].lower() == 'antigravity.exe'
+                        and fields[1].isdigit() and fields[1] != my_pid):
+                    pids.append(fields[1])
+            return pids
         out = subprocess.run(['ps', '-eo', 'pid=,command='],
                              capture_output=True, text=True, timeout=5).stdout
         pids = []
@@ -294,10 +345,18 @@ def launch_antigravity(exe, proxy=None):
         print(f"[代理] {proxy}")
         for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'):
             env[k] = proxy
+    popen_kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        env=env)
+    if IS_WINDOWS:
+        # 脱离本进程的控制台/进程组，宿主退出不影响 Antigravity。
+        popen_kwargs['creationflags'] = (
+            getattr(subprocess, 'DETACHED_PROCESS', 0x00000008)
+            | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+            | getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+    else:
+        popen_kwargs['start_new_session'] = True
     try:
-        return subprocess.Popen(
-            [exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env, start_new_session=True)
+        return subprocess.Popen([exe], **popen_kwargs)
     except Exception as e:
         print(f"[错误] 启动失败: {e}")
         return None
@@ -1435,17 +1494,17 @@ def http_json(host, port, path, timeout=0.5):
 
 
 def _port_cache_file():
-    """端口缓存放用户私有目录，不放 /tmp。
+    """端口缓存放用户私有目录，不放共享临时目录。
 
     /tmp 是共享目录，固定名文件可被同机其他用户抢先建成符号链接，
-    我们再以自己的权限写进去。改用 ~/Library/Caches（0700）就没有这个面。
+    我们再以自己的权限写进去。改用用户私有缓存目录（macOS 0700 /
+    Windows %LOCALAPPDATA% 本身即用户私有）就没有这个面。
     """
-    base = os.path.expanduser('~/Library/Caches/com.nick.jack-hanhua')
     try:
-        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.makedirs(_CACHE_BASE, mode=0o700, exist_ok=True)
     except Exception:
         pass
-    return os.path.join(base, 'last_cdp_port')
+    return os.path.join(_CACHE_BASE, 'last_cdp_port')
 
 
 PORT_CACHE_FILE = _port_cache_file()
@@ -1470,10 +1529,18 @@ def discover_cdp_port(timeout=30):
 
 def _scan_ports_once():
     # 1. 极速直达路径：读取 Chromium / Electron 原生 DevToolsActivePort（0.001s）
-    for devtools_cand in (
-        os.path.expanduser('~/Library/Application Support/Antigravity/DevToolsActivePort'),
-        os.path.expanduser('~/Library/Application Support/Google/Antigravity/DevToolsActivePort'),
-    ):
+    if IS_WINDOWS:
+        _appdata = os.environ.get('APPDATA') or ''
+        devtools_candidates = tuple(p for p in (
+            os.path.join(_appdata, 'Antigravity', 'DevToolsActivePort'),
+            os.path.join(_appdata, 'Google', 'Antigravity', 'DevToolsActivePort'),
+        ) if _appdata)
+    else:
+        devtools_candidates = (
+            os.path.expanduser('~/Library/Application Support/Antigravity/DevToolsActivePort'),
+            os.path.expanduser('~/Library/Application Support/Google/Antigravity/DevToolsActivePort'),
+        )
+    for devtools_cand in devtools_candidates:
         try:
             if os.path.exists(devtools_cand):
                 with open(devtools_cand, 'r') as f:
@@ -1500,27 +1567,46 @@ def _scan_ports_once():
     except Exception:
         pass
 
-    # 3. 扫描活跃进程端口（单次合并 lsof，避免循环内反复调用）
+    # 3. 扫描活跃进程端口（单次合并 lsof / netstat，避免循环内反复调用）
     pids = [pid for pid in antigravity_pids() if pid.isdigit()]
     if pids:
-        try:
-            ls = subprocess.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', ','.join(pids)],
-                                capture_output=True, timeout=2).stdout.decode()
-            for m in re.finditer(r'127[.]0[.]0[.]1:(\d+)', ls):
-                p = int(m.group(1))
-                try:
-                    data = http_json('127.0.0.1', p, '/json/version')
-                    if isinstance(data, dict) and _CDP_BROWSER_HINT in str(data.get('Browser', '')):
-                        try:
-                            with open(PORT_CACHE_FILE, 'w') as f:
-                                f.write(str(p))
-                        except Exception:
-                            pass
-                        return p
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        listen_ports = []
+        if IS_WINDOWS:
+            try:
+                ns = subprocess.run(['netstat', '-ano', '-p', 'tcp'],
+                                    capture_output=True,
+                                    timeout=5).stdout.decode(errors='replace')
+                pid_set = set(pids)
+                for line in ns.splitlines():
+                    cols = line.split()
+                    if (len(cols) >= 5 and cols[0].upper() == 'TCP'
+                            and cols[3].upper() == 'LISTENING'
+                            and cols[4] in pid_set):
+                        m = re.match(r'127[.]0[.]0[.]1:(\d+)$', cols[1])
+                        if m:
+                            listen_ports.append(int(m.group(1)))
+            except Exception:
+                pass
+        else:
+            try:
+                ls = subprocess.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', ','.join(pids)],
+                                    capture_output=True, timeout=2).stdout.decode()
+                for m in re.finditer(r'127[.]0[.]0[.]1:(\d+)', ls):
+                    listen_ports.append(int(m.group(1)))
+            except Exception:
+                pass
+        for p in listen_ports:
+            try:
+                data = http_json('127.0.0.1', p, '/json/version')
+                if isinstance(data, dict) and _CDP_BROWSER_HINT in str(data.get('Browser', '')):
+                    try:
+                        with open(PORT_CACHE_FILE, 'w') as f:
+                            f.write(str(p))
+                    except Exception:
+                        pass
+                    return p
+            except Exception:
+                continue
     return None
 
 
@@ -1739,11 +1825,28 @@ def daemon_step(log):
 # ============================================================
 
 def start_daemon_detached(interval=DAEMON_INTERVAL):
-    """double-fork 拉起守护进程：脱离当前进程组（init 接管），宿主退出不影响。
+    """拉起脱离宿主的守护进程，宿主退出不影响。
 
-    用于 launchd 不可达的环境（如从 Electron 桌面端派生的终端——
-    launchctl bootstrap/load 会报 Input/output error 5）。
+    macOS 用 double-fork（脱离当前进程组，init 接管），用于 launchd 不可达的
+    环境（如从 Electron 桌面端派生的终端——launchctl bootstrap/load 会报
+    Input/output error 5）。Windows 用 DETACHED_PROCESS 等 creationflags。
     """
+    if IS_WINDOWS:
+        try:
+            os.makedirs(os.path.dirname(DAEMON_LOG), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                [_bg_python(), os.path.abspath(__file__), '--daemon',
+                 '--interval', str(interval)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, close_fds=True,
+                **_detached_popen_kwargs())
+            time.sleep(0.5)
+            return True
+        except Exception:
+            return False
     try:
         pid = os.fork()
         if pid > 0:
@@ -1765,7 +1868,68 @@ def start_daemon_detached(interval=DAEMON_INTERVAL):
     return False
 
 
+def install_autostart_win():
+    """Windows 登录自启：写 HKCU Run 注册表项，并立刻拉起守护进程。"""
+    script = os.path.abspath(__file__)
+    python = _bg_python()
+    cmd = f'"{python}" "{script}" --daemon'
+    r = subprocess.run(
+        ['reg', 'add', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME,
+         '/t', 'REG_SZ', '/d', cmd, '/f'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[错误] 注册开机自启失败: {(r.stderr or r.stdout).strip()}")
+        sys.exit(1)
+    print("[成功] 已注册登录自启（注册表 Run 项）")
+    print(f"       注册表: HKCU\\{RUN_KEY_PATH}\\{RUN_KEY_NAME}")
+    print(f"       日志: {DAEMON_LOG}")
+    if start_daemon_detached():
+        print("[效果] 守护进程已启动；打开 Antigravity 后几秒内自动汉化，无需任何手动操作")
+    else:
+        print("[提示] 守护进程拉起失败，重启系统后会自动生效；或手动执行: "
+              f"{python} {script} --daemon")
+
+
+def _kill_daemon_win():
+    """结束正在运行的汉化守护进程（pythonw/python + jack.py --daemon）。"""
+    ps = ("Get-CimInstance Win32_Process | "
+          "Where-Object { $_.Name -match '^pythonw?\\.exe$' "
+          "-and $_.CommandLine -match 'jack\\.py' "
+          "-and $_.CommandLine -match '--daemon' } | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+          "-ErrorAction SilentlyContinue }")
+    try:
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def uninstall_autostart_win():
+    r = subprocess.run(
+        ['reg', 'delete', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME, '/f'],
+        capture_output=True, text=True)
+    removed = r.returncode == 0
+    _kill_daemon_win()
+    if removed:
+        print("[成功] 已停止守护并移除登录自启（注册表 Run 项）")
+        print("[效果] 下次打开 Antigravity 将回到英文原版")
+    else:
+        print("[提示] 未安装（注册表 Run 项不存在）")
+
+
+def autostart_status_win():
+    r = subprocess.run(
+        ['reg', 'query', 'HKCU\\' + RUN_KEY_PATH, '/v', RUN_KEY_NAME],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return "未安装"
+    return "已安装（登录自启，注册表 Run 项）"
+
+
 def install_launchd():
+    if IS_WINDOWS:
+        return install_autostart_win()
     script = os.path.abspath(__file__)
     python = sys.executable or 'python3'
     # 用 plistlib 而不是 f-string 拼 XML：路径里出现 & < > 时手拼会生成非法 plist，
@@ -1811,6 +1975,8 @@ def install_launchd():
 
 
 def uninstall_launchd():
+    if IS_WINDOWS:
+        return uninstall_autostart_win()
     # 杀掉所有守护进程（launchd 管理的或直接拉起的）
     subprocess.run(['pkill', '-f', 'jack.py --daemon'], capture_output=True)
     if os.path.exists(PLIST_PATH):
@@ -1827,6 +1993,8 @@ def uninstall_launchd():
 
 
 def launchd_status():
+    if IS_WINDOWS:
+        return autostart_status_win()
     if not os.path.exists(PLIST_PATH):
         return "未安装"
     r = subprocess.run(['launchctl', 'list'], capture_output=True, text=True)
@@ -1846,14 +2014,14 @@ def show_status():
     print("=== Antigravity 汉化状态 ===")
     running = is_antigravity_running()
     print(f"Antigravity 进程: {'运行中' if running else '未运行'}")
-    print(f"launchd 守护:     {launchd_status()}")
+    print(f"{'登录自启守护' if IS_WINDOWS else 'launchd 守护'}:     {launchd_status()}")
     dict_map = load_dictionary()
     print(f"字典词条:         {len(dict_map)} 条")
     port = discover_cdp_port(timeout=3)
     if not port:
         print("CDP 端口:         未发现（Antigravity 未运行或未开放）")
         return
-    print(f"CDP 端口:         {port}（macOS 随机分配）")
+    print(f"CDP 端口:         {port}（随机分配）")
     page = get_main_page(port)
     if not page:
         print("主界面页面:       未就绪")
@@ -1986,7 +2154,13 @@ def click_main(verbose=True):
 
     if not is_antigravity_running():
         say("[启动] Antigravity 未运行，正在启动...")
-        subprocess.run(['open', '-a', 'Antigravity'])
+        if IS_WINDOWS:
+            exe = find_antigravity_exe()
+            if not exe:
+                return False, "未找到 Antigravity 安装路径"
+            launch_antigravity(exe)
+        else:
+            subprocess.run(['open', '-a', 'Antigravity'])
         for _ in range(150):
             if is_antigravity_running():
                 break
@@ -2016,19 +2190,39 @@ def click_main(verbose=True):
     return True, "Antigravity 界面已汉化"
 
 
+def _bg_python():
+    """后台静默跑本脚本用的解释器：Windows 优先 pythonw.exe（不弹黑窗）。"""
+    exe = sys.executable
+    if IS_WINDOWS:
+        cand = os.path.join(os.path.dirname(exe), 'pythonw.exe')
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
+def _detached_popen_kwargs():
+    """脱离宿主的 Popen 参数（Windows 用 creationflags，macOS 用新会话）。"""
+    if IS_WINDOWS:
+        return {'creationflags': (
+            getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+            | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+            | getattr(subprocess, 'DETACHED_PROCESS', 0x00000008))}
+    return {'start_new_session': True}
+
+
 def _spawn_guard(seconds=30, port=None):
     """把守护补注挪到脱离的子进程，让调用方立刻返回。
 
     端口透传下去：调用方刚注入成功，端口是已知的，子进程不必再扫一遍。
     """
     try:
-        cmd = [sys.executable, os.path.abspath(__file__),
+        cmd = [_bg_python(), os.path.abspath(__file__),
                '--guard', '--watch', str(seconds)]
         if port:
             cmd += ['--port', str(port)]
         subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
+            **_detached_popen_kwargs())
         return True
     except Exception:
         return False
@@ -2064,12 +2258,53 @@ def guard_main(seconds=30, port=None):
 # 桌面图标生成（可移植，路径自动用当前用户家目录）
 # ============================================================
 
+def create_shortcut_win():
+    """在桌面（或 Desktop\\app，若存在）生成「Antigravity 汉化」双击快捷方式。
+
+    .lnk 通过 WScript.Shell COM 创建（Python 标准库没有 COM，借 PowerShell 中转）。
+    快捷方式内部用当前脚本与 pythonw 的绝对路径——任何人拿到这份代码跑这条
+    命令，都会生成指向他自己路径的图标。
+    """
+    script = os.path.abspath(__file__)
+    python = _bg_python()
+    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+    app_dir = os.path.join(desktop, 'app')
+    target_dir = app_dir if os.path.isdir(app_dir) else desktop
+    lnk_path = os.path.join(target_dir, 'Antigravity 汉化.lnk')
+    icon = find_antigravity_exe() or ''
+
+    def psq(s):
+        return "'" + s.replace("'", "''") + "'"
+
+    ps = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        f"$s = $ws.CreateShortcut({psq(lnk_path)}); "
+        f"$s.TargetPath = {psq(python)}; "
+        f"$s.Arguments = {psq(chr(34) + script + chr(34) + ' --click')}; "
+        f"$s.WorkingDirectory = {psq(os.path.dirname(script))}; "
+        f"$s.Description = {psq('Antigravity 界面汉化（运行时注入，不改安装文件）')}; "
+    )
+    if icon:
+        ps += f"$s.IconLocation = {psq(icon + ',0')}; "
+    ps += "$s.Save()"
+    r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not os.path.exists(lnk_path):
+        print(f"[错误] 生成快捷方式失败: {(r.stderr or r.stdout).strip()}")
+        sys.exit(1)
+    print(f"[成功] 快捷方式已生成: {lnk_path}")
+    print("[用法] 双击即完成汉化（Antigravity 没开会自动启动）")
+    print("[提示] 想恢复英文：直接正常打开 Antigravity（不双击汉化图标）即可")
+
+
 def create_shortcut():
     """在桌面生成「Antigravity 汉化」双击图标。
 
     AppleScript 内部用当前脚本与 python 的绝对路径——同事拿到包跑这条
     命令，会生成指向他自己路径的图标，不依赖分享者的目录结构。
     """
+    if IS_WINDOWS:
+        return create_shortcut_win()
     script = os.path.abspath(__file__)
     python = sys.executable or '/usr/bin/python3'
     app_path = os.path.expanduser('~/Desktop/Antigravity 汉化.app')
@@ -2160,7 +2395,7 @@ def manual_main(args):
         if launch_antigravity(exe, proxy=args.proxy) is None:
             print("[错误] Antigravity 启动失败，请检查安装路径与权限。")
             sys.exit(1)
-        print("[等待] 扫描 Antigravity 监听的 CDP 端口（macOS 为随机分配）...")
+        print("[等待] 扫描 Antigravity 监听的 CDP 端口（随机分配）...")
         port = discover_cdp_port(timeout=60)
 
     if not port:
@@ -2195,7 +2430,7 @@ def main():
         description="Antigravity 2.0 运行时汉化工具（CDP 注入 + 自动化守护）")
     parser.add_argument("--install-dir", help="Antigravity 安装目录或可执行文件路径（默认自动探测）")
     parser.add_argument("--port", type=int, default=None,
-                        help="CDP 端口（一般不用给：macOS 上端口随机分配，脚本自动扫描发现；主要供 --guard 内部透传）")
+                        help="CDP 端口（一般不用给：端口随机分配，脚本自动扫描发现；主要供 --guard 内部透传）")
     parser.add_argument("--no-launch", action="store_true",
                         help="不启动 Antigravity，只注入已运行的实例")
     parser.add_argument("--watch", type=int, default=30,
@@ -2207,9 +2442,9 @@ def main():
     parser.add_argument("--interval", type=int, default=DAEMON_INTERVAL,
                         help=f"守护巡检间隔秒数（默认 {DAEMON_INTERVAL}）")
     parser.add_argument("--install", action="store_true",
-                        help="安装 launchd 开机自启（登录后自动守护，macOS）")
+                        help="安装登录自启守护（macOS launchd / Windows 注册表 Run 项）")
     parser.add_argument("--uninstall", action="store_true",
-                        help="卸载 launchd 自启")
+                        help="卸载登录自启守护")
     parser.add_argument("--click", action="store_true",
                         help="双击图标模式：Antigravity 没开就先启动，然后自动注入")
     parser.add_argument("--guard", action="store_true",
@@ -2237,6 +2472,16 @@ def main():
     elif args.click:
         ok, msg = click_main()
         print(("[成功] " if ok else "[失败] ") + msg, flush=True)
+        if IS_WINDOWS:
+            # 双击快捷方式时没有终端窗口，结果用系统弹窗告知（对应 macOS 的通知）
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0, msg,
+                    "Antigravity 汉化" if ok else "Antigravity 汉化失败",
+                    0x40 if ok else 0x10)
+            except Exception:
+                pass
         sys.exit(0 if ok else 1)
     elif args.create_shortcut:
         create_shortcut()
